@@ -42,6 +42,8 @@ from axolotl.utils.distributed import (
     is_main_process,
     zero_first,
 )
+from sklearn.metrics import accuracy_score
+import re
 
 if TYPE_CHECKING:
     from axolotl.core.trainer_builder import AxolotlTrainingArguments
@@ -555,6 +557,161 @@ def causal_lm_bench_eval_callback_factory(trainer: Trainer, tokenizer):
             return control
 
     return CausalLMBenchEvalCallback
+
+def causal_lm_as_judge_eval_callback_factory(trainer: Trainer, tokenizer):
+    class CausalLMAsJudgeEvalCallback(TrainerCallback):
+        """Callback to log prediction values during each evaluation"""
+
+        def __init__(self, cfg):
+            self.cfg = cfg
+            self.logged = False
+
+        def on_evaluate(
+            self,
+            args: AxolotlTrainingArguments,  # pylint: disable=unused-argument
+            state: TrainerState,
+            control: TrainerControl,
+            train_dataloader,  # pylint: disable=unused-argument
+            eval_dataloader,
+            **kwargs,  # pylint: disable=unused-argument
+        ):
+            trainer.model.eval()
+            device = torch.device(self.cfg.device)
+
+            # pylint: disable=duplicate-code
+            generation_config = GenerationConfig(
+                max_new_tokens=self.cfg.eval_max_new_tokens,
+                bos_token_id=tokenizer.bos_token_id,
+                eos_token_id=tokenizer.eos_token_id,
+                pad_token_id=tokenizer.pad_token_id,
+                do_sample=False,
+                use_cache=True,
+                return_dict_in_generate=True,
+                output_attentions=False,
+                output_hidden_states=False,
+                output_scores=False,
+            )
+
+            def find_ranges(lst):
+                ranges = []
+                start = 0
+                for i in range(1, len(lst)):
+                    if lst[i] == 0:
+                        ranges.append((start, i - 1))
+                        start = i
+                end = len(lst) - 1
+                ranges.append((start, end))
+                return ranges
+
+            def evaluate_preds(sources, predictions, references):
+                def extract_label_from_text(text):
+                    match = re.search(r'"output"\s*:\s*("([^"]+)"|(\d+))', text)
+                    if match:
+                        predicted_label = int(match.group(1).strip('"'))
+                    else:
+                        predicted_label = 0
+                    return predicted_label
+                
+                scores = {}
+                predicted_labels = [extract_label_from_text(pred) for pred in predictions]
+                target_labels = [extract_label_from_text(target) for target in references]                
+                scores["eval/accuracy"] = accuracy_score(target_labels, predicted_labels)
+                return scores
+
+            def predict_with_generate():
+                eval_src, eval_pred, eval_ref = [], [], []
+
+                for batch in tqdm(eval_dataloader):
+                    batch_labels = batch["labels"].to(device)
+                    batch_input_ids = batch["input_ids"].to(device)
+
+                    if "position_ids" in batch:
+                        batch_pos_ids = batch["position_ids"].tolist()
+                    else:
+                        batch_pos_ids = [None] * len(batch["input_ids"])
+
+                    prompt_token_ids_list = []
+                    completion_token_ids_list = []
+
+                    for input_ids_all, labels_all, pos_ids in zip(
+                        batch_input_ids,
+                        batch_labels,
+                        batch_pos_ids,
+                    ):
+                        if pos_ids is None:
+                            pos_ranges = [(0, len(input_ids_all) - 1)]
+                        else:
+                            pos_ranges = find_ranges(pos_ids)
+
+                        for pos_range in pos_ranges:
+                            start, end = pos_range
+                            if start == end:
+                                continue
+
+                            input_ids = input_ids_all[start : end + 1]
+                            labels = labels_all[start : end + 1]
+
+                            tokens_without_loss = labels == IGNORE_INDEX
+                            tokens_with_loss = labels != IGNORE_INDEX
+                            tokens_exclude_padding = input_ids != tokenizer.pad_token_id
+                            prompt_token_includes = (
+                                tokens_without_loss & tokens_exclude_padding
+                            )
+
+                            prompt_token_ids = input_ids[prompt_token_includes]
+                            prompt_token_ids_list.append(prompt_token_ids)
+
+                            completion_token_ids = input_ids[tokens_with_loss]
+                            completion_token_ids_list.append(completion_token_ids)
+
+                    prompt_texts = tokenizer.batch_decode(
+                        prompt_token_ids_list, skip_special_tokens=True
+                    )
+                    completion_texts = tokenizer.batch_decode(
+                        completion_token_ids_list, skip_special_tokens=True
+                    )
+
+                    with torch.no_grad():
+                        prompt_encoding = tokenizer(
+                            prompt_texts, padding=True, return_tensors="pt"
+                        ).to(self.cfg.device)
+                        predictions = trainer.model.generate(
+                            **prompt_encoding, generation_config=generation_config
+                        )
+
+                    prediction_all_tokens = predictions["sequences"].cpu().tolist()
+                    prediction_without_prompt_tokens_list = []
+                    for prompt_token_ids, prediction_tokens in zip(
+                        prompt_token_ids_list, prediction_all_tokens
+                    ):
+                        prediction_without_prompt_tokens = prediction_tokens[
+                            len(prompt_token_ids) :
+                        ]
+                        prediction_without_prompt_tokens_list.append(
+                            prediction_without_prompt_tokens
+                        )
+
+                    predicted_texts = tokenizer.batch_decode(
+                        prediction_without_prompt_tokens_list, skip_special_tokens=True
+                    )
+
+                    eval_src.extend(prompt_texts)
+                    eval_pred.extend(predicted_texts)
+                    eval_ref.extend(completion_texts)
+
+                    # we do not want to evaluate on entire val set
+                    if len(eval_src >= 1000):
+                        break
+
+                return eval_src, eval_pred, eval_ref
+
+            if is_main_process():
+                eval_preds = predict_with_generate()
+                trainer.log(evaluate_preds(*eval_preds))
+
+            return control
+
+    return CausalLMAsJudgeEvalCallback
 
 
 def log_prediction_callback_factory(trainer: Trainer, tokenizer, logger: str):

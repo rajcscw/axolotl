@@ -58,6 +58,7 @@ from axolotl.utils.callbacks import (
     SaveModelCallback,
     bench_eval_callback_factory,
     causal_lm_bench_eval_callback_factory,
+    causal_lm_as_judge_eval_callback_factory,
     log_prediction_callback_factory,
 )
 from axolotl.utils.callbacks.lisa import lisa_callback_factory
@@ -1176,7 +1177,7 @@ class HFCausalTrainerBuilder(TrainerBuilderBase):
         if self.cfg.do_bench_eval:
             callbacks.append(bench_eval_callback_factory(trainer, self.tokenizer))
         if self.cfg.do_causal_lm_eval:
-            CausalLMBenchEvalCallback = causal_lm_bench_eval_callback_factory(
+            CausalLMBenchEvalCallback = causal_lm_as_judge_eval_callback_factory(
                 trainer, self.tokenizer
             )
             callbacks.append(CausalLMBenchEvalCallback(self.cfg))
