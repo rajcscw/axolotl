@@ -700,7 +700,7 @@ def causal_lm_as_judge_eval_callback_factory(trainer: Trainer, tokenizer):
                     eval_ref.extend(completion_texts)
 
                     # we do not want to evaluate on entire val set
-                    if len(eval_src >= 1000):
+                    if len(eval_src) >= 1000:
                         break
 
                 return eval_src, eval_pred, eval_ref
